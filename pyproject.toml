@@ -1,0 +1,28 @@
+[project]
+name = "notemanager"
+version = "0.1.0"
+description = "Obsidian note report automation"
+authors = [
+    {name = "snupark@snu.ac.kr"}
+]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "typer (>=0.16.0,<0.17.0)",
+    "pydantic (>=2.11.5,<3.0.0)",
+    "watchdog (>=6.0.0,<7.0.0)",
+    "requests (>=2.32.3,<3.0.0)",
+    "fpdf (>=1.7.2,<2.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.5"
+black = "^25.1.0"
+isort = "^6.0.1"
+flake8 = "^7.2.0"
+
