@@ -27,9 +27,13 @@ def scan_vault(vault: Path) -> Dict[str, str]:
     { str(path): content } dict 반환
     
     vault 내 모든 하위 폴더를 재귀적으로 탐색하며 .md 파일을 찾습니다.
+    단, "Calendar" 폴더의 하위 폴더는 제외합니다.
     """
     files = {}
     for md in vault.rglob("*.md"):  # rglob()으로 모든 하위 폴더 재귀 탐색
+        # Calendar 폴더의 하위 폴더인 경우 건너뛰기
+        if "Calendar" in md.parts and md.parts.index("Calendar") < len(md.parts) - 1:
+            continue
         files[str(md)] = md.read_text(encoding="utf-8")
     return files
 

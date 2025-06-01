@@ -16,7 +16,8 @@ dependencies = [
     "frontmatter (>=3.0.8,<4.0.0)",
     "markdown (>=3.8,<4.0)",
     "beautifulsoup4 (>=4.13.4,<5.0.0)",
-    "python-frontmatter (>=1.1.0,<2.0.0)"
+    "python-frontmatter (>=1.1.0,<2.0.0)",
+    "ollama (>=0.5.1,<0.6.0)"
 ]
 
 
