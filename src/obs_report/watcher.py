@@ -5,17 +5,21 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 from datetime import datetime, timedelta
 import difflib
+import os
 
-STATE_FILE = Path.home() / ".obs_summary" / "state.json"
+def get_state_file() -> Path:
+    return Path(os.environ.get("USERPROFILE", str(Path.home()))) / ".obs_summary" / "state.json"
 
 def load_previous_state() -> Dict[str, str]:
-    if not STATE_FILE.exists():
+    state_file = get_state_file()
+    if not state_file.exists():
         return {}
-    return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    return json.loads(state_file.read_text(encoding="utf-8"))
 
 def save_state(state: Dict[str, str]):
-    STATE_FILE.parent.mkdir(exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    state_file = get_state_file()
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    state_file.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 def scan_vault(vault: Path) -> Dict[str, str]:
     """
