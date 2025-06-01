@@ -25,7 +25,7 @@ def parse_markdown(file_path: Path) -> DocumentData:
     를 포함하는 DocumentData 객체로 반환합니다.
     """
     # 1) frontmatter 파싱
-    post = frontmatter.load(file_path.read_text(encoding="utf-8"))
+    post = frontmatter.load(str(file_path))
     meta = post.metadata
 
     # 2) 본문(마크다운) → HTML → BeautifulSoup로 파싱
@@ -37,7 +37,7 @@ def parse_markdown(file_path: Path) -> DocumentData:
     title = headers[0] if headers else file_path.stem
 
     # 4) 순수 텍스트 컨텐츠 (HTML 태그 제거)
-    body_text = soup.get_text(separator="\n").strip()
+    body_text = " ".join(soup.get_text(separator=" ").split())  # 연속된 공백을 하나로 합침
 
     return DocumentData(
         path=str(file_path),
