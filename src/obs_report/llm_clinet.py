@@ -3,19 +3,23 @@
 from typing import List, Optional, Tuple
 import requests
 from pydantic import BaseModel, Field
-from parser import DocumentData
+from .parser import DocumentData
 from pathlib import Path
 import re
 from abc import ABC, abstractmethod
 import json
 from functools import wraps
 from typing import Callable, TypeVar, Any
+from .parser import parse_markdown
+from .watcher import get_recent_changes
+import ollama
+import os
 
 class LLMRequest(BaseModel):
     model: str = Field(..., description="LLM model name")
     messages: List[dict] = Field(..., description="List of messages in chat completion format")
     temperature: float = Field(0.1, ge=0.0, le=1.0)
-    max_tokens: int = Field(1024, description="Maximum number of tokens")
+    max_tokens: Optional[int] = Field(None, description="Maximum number of tokens")
 
 class Message(BaseModel):
     role: str
@@ -40,11 +44,12 @@ class BaseLLMClient(ABC):
         self.model_name = model_name
         self.base_url = base_url
         self.temperature = 0.1
-        self.max_tokens = 1024
+        self.max_tokens: Optional[int] = 1024
         self.system_prompt = f"You are a helpful assistant. Always answer in {language}."
         self.timeout = 120  # Increased timeout to 120 seconds
         self.max_retries = 3  # Maximum number of retries
-        self.chat_history = []  # 대화 기록 저장
+        self.chat_history = {}  # 대화 기록 저장
+        self.current_attempt = 0
 
     def __copy__(self):
         """얕은 복사 구현"""
@@ -80,8 +85,7 @@ class BaseLLMClient(ABC):
     def _create_request(self, messages: List[dict]) -> LLMRequest:
         """Create LLM request object"""
         # Add system prompt only if not present
-        if not any(msg.get("role") == "system" for msg in messages):
-            messages = [{"role": "system", "content": self.system_prompt}] + messages
+        messages = [{"role": "system", "content": self.system_prompt}] + messages
 
         # 대화 기록에 새로운 메시지 추가
         self.chat_history.extend(messages)
@@ -96,6 +100,10 @@ class BaseLLMClient(ABC):
     def _call_llm(self, request: LLMRequest) -> LLMResponse:
         """Call LLM API (with retry logic)"""
         payload = request.model_dump()
+        
+        # max_tokens가 None이면 해당 필드 제거
+        if payload.get('max_tokens') is None:
+            payload.pop('max_tokens', None)
         
         for attempt in range(self.max_retries):
             try:
@@ -124,7 +132,18 @@ class BaseLLMClient(ABC):
         """Send chat request and process response"""
         request = self._create_request(messages)
         response = self._call_llm(request)
-        return self.process_response(response)
+        report = self.process_response(response)
+
+        history = messages + [{"role": "assistant", "content": report}]
+
+        self.chat_history[self.current_attempt] = history
+        self.current_attempt += 1
+        return report
+    
+    def clear_chat_history(self):
+        """Clear chat history"""
+        self.chat_history = {}
+        self.current_attempt = 0
 
 class DeepSeekClient(BaseLLMClient):
     """Client for DeepSeek model"""
@@ -162,25 +181,61 @@ class GeneratorAgent:
     def __init__(self, llm_client: BaseLLMClient):
         self.llm_client = llm_client
         self.llm_client.set_system_prompt(
-            "You are a helpful assistant that summarizes notes and generates daily activity reports. "
-            "You should follow these rules strictly:\n"
-            "1. For individual note summaries:\n"
-            "   - Focus on extracting key information and providing concise summaries\n"
-            "   - Include the following sections if not empty:\n"
-            "     * Key keywords for each note\n"
-            "     * Type of work performed (e.g., research, idea organization, meeting notes)\n"
-            "     * Main content summary\n"
-            "   - Keep each note's summary up to 5 sentences\n"
-            "   - Use bullet points for better readability\n"
-            "2. For daily activity reports:\n"
-            "   - Provide a comprehensive summary of the day's activities\n"
-            "   - Include sections for newly created, modified, and deleted notes\n"
-            "   - For each note, include:\n"
-            "     * Key keywords\n"
-            "     * Type of work performed\n"
-            "     * Main content summary\n"
-            "   - Use bullet points for better readability\n"
-            "   - End with a summary of main types of work, key themes, and overall activity patterns"
+"""You are a helpful assistant specialized in generating two types of reports:
+
+1) Report Type = NoteSummary  
+   - Generate a concise summary for a single note.
+
+2) Report Type = DailyReport  
+   - Generate an aggregated daily activity report based on multiple NoteSummary outputs that you receive as input.
+
+Common Rules (apply to both report types):  
+- Always produce structured output using bullet points.  
+- Keep language clear and concise; avoid unnecessary explanations.  
+- If a section has no content, omit it entirely.  
+- Answer in Markdown format.
+
+---
+
+NoteSummary Rules (when Report Type = NoteSummary):  
+0. **Empty Note Exception**  
+   - If the note’s content is empty or contains only whitespace, output exactly:  
+     ```
+     This note is empty. No summary available.
+     ```  
+   - Do not produce Keywords, Work Type, or Summary sections.
+
+1. **Determine Note Type**  
+   - **Created Note**: summarize the full file content.  
+   - **Modified Note**: summarize only the listed changes (refer to the current content for full context); do not restate the full content.  
+   - **Deleted Note**: summarize the content of the deleted file.
+
+2. For all non-empty notes, use up to 5 sentences total, organized into these bullet sections in order:  
+   - **Keywords**: key terms or phrases extracted from the relevant content (full content for created, change snippets for modified, deleted content for deleted)  
+   - **Work Type**: one of Research, Meeting Notes, Idea Organization, etc.  
+   - **Summary**: concise main points (for modified notes, describe what changed; for deleted notes, describe what was in the file)
+
+3. Use bullet points for each section.
+
+---
+
+DailyReport Rules (when Report Type = DailyReport):  
+- You will receive a list of filenames and their corresponding NoteSummary outputs.  
+- **Do not** reprint the full NoteSummary contents.  
+- Under three headings, list only the filenames:  
+  * Newly Created Notes  
+  * Modified Notes  
+  * Deleted Notes  
+- **Individual File Summaries**: For each filename, provide a brief summary based on its NoteSummary.  
+- **Comprehensive Activity Report**: Based on all NoteSummary outputs, write a cohesive report that covers:  
+  * **Overall Work Types**: frequency/counts of each work type  
+  * **Key Themes**: main topics or keywords across all notes  
+  * **Activity Patterns**: brief observations on the day’s work distribution
+
+---
+
+When you receive a request, you will be told which report type to use and provided the appropriate input (raw note data for NoteSummary or a filename list with NoteSummary outputs for DailyReport). Follow only the rules for that report type, and produce output that strictly adheres to this structure.
+"""
         , mode='append')
 
     def summarize_file_created(self, doc: DocumentData) -> str:
@@ -188,8 +243,10 @@ class GeneratorAgent:
         file_name = Path(doc.path).name
         messages = [{
             "role": "user",
-            "content": f"Please summarize the following 'individual note' which is newly created:\n\n"
+            "content": f"Generate a NoteSummary base on the information below:\n\n"
                       f"Filename: {file_name}\n"
+                      f"Report Type: NoteSummary\n"
+                      f"Note Type: Created Note\n"
                       f"Title: {doc.title}\n"
                       f"Headers: {', '.join(doc.headers)}\n"
                       f"Content: {doc.content}\n"
@@ -199,14 +256,17 @@ class GeneratorAgent:
     def summarize_file_changes(self, doc: DocumentData) -> str:
         """Summarize file changes"""
         file_name = Path(doc.path).name
+        changes_text = "\n".join(doc.changes) if doc.changes is not None else "변경사항 없음"
         messages = [{
             "role": "user",
-            "content": f"Please summarize the changes in the following 'individual note':\n\n"
+            "content": f"Generate a NoteSummary base on the information below':\n\n"
                       f"Filename: {file_name}\n"
+                      f"Report Type: NoteSummary\n"
+                      f"Note Type: Modified Note\n"
                       f"Title: {doc.title}\n"
                       f"Headers: {', '.join(doc.headers)}\n"
-                      f"Previous Content: {doc.content}\n"
-                      f"Changes:\n{''.join(doc.changes)}"
+                      f"Current Content: {doc.content}\n"
+                      f"Changes:\n{changes_text}"
         }]
         return self.llm_client.chat(messages)
 
@@ -215,8 +275,10 @@ class GeneratorAgent:
         file_name = Path(doc.path).name
         messages = [{
             "role": "user",
-            "content": f"Please summarize the following 'individual note' which is deleted:\n\n"
+            "content": f"Generate a NoteSummary base on the information below:\n\n"
                       f"Filename: {file_name}\n"
+                      f"Report Type: NoteSummary\n"
+                      f"Note Type: Deleted Note\n"
                       f"Title: {doc.title}\n"
                       f"Headers: {', '.join(doc.headers)}\n"
                       f"Content: {doc.content}\n"
@@ -229,28 +291,39 @@ class CriticAgent:
     def __init__(self, llm_client: BaseLLMClient):
         self.llm_client = llm_client
         self.llm_client.set_system_prompt(
-            "You are a strict quality control agent for note summaries. "
-            "Your task is to validate if the generated report follows all required rules. "
-            "You will receive two inputs:\n"
-            "1. The target LLM's system prompt.\n"
-            "2. The response generated by the target LLM.\n"
-            "You must verify whether the generated response adheres to the system prompt. "
-            "If it does not, specify which aspect of the prompt was violated.\n"
-            "Respond with a JSON object containing:\n"
-            "{\n"
-            '  "is_valid": boolean,\n'
-            '  "issues": [list of issues found],\n'
-            '  "suggestions": [list of improvement suggestions]\n'
-            "}\n"
+            """
+You are a strict Quality Control Agent for note summaries.  
+Your job is to check whether a generated report fully complies with its system prompt and the user's original request.
+
+Inputs (in this exact order):  
+1. The System Prompt used by the report-generating agent.  
+2. The User Request given to the report-generating agent
+3. The Report text produced by that agent.  
+
+Tasks:  
+- Validate that every requirement in the System Prompt is satisfied.  
+- Confirm that the Report also correctly follows the User Request (e.g., correct report_type and note_type handling).  
+- Identify any violations, omissions, or formatting errors.
+
+Output:  
+Return a single JSON object with three fields:
+```json
+{
+"is_valid": <true|false>,
+"issues":    [<simple, concise list of violations>],
+"suggestions":[<simple, concise list of fixes>]
+}
+"""
         , mode='append')
 
-    def validate_report(self, report: str, target_prompt: str) -> Tuple[bool, List[str], List[str]]:
+    def validate_report(self, report: str, target_prompt: str, user_request: str) -> Tuple[bool, List[str], List[str]]:
         """Validate report"""
         messages = [{
             "role": "user",
-            "content": f"Please validate the following system prompt and generated report:\n\n"
-                      f"Target LLM's system prompt:\n{target_prompt}\n\n"
-                      f"Target LLM's generated report:\n{report}"
+            "content": f"Validate the following report:\n\n"
+                      f"Target LLM's System Prompt:\n{target_prompt}\n\n"
+                      f"Target LLM's User Request:\n{user_request}\n\n"
+                      f"Generated Report:\n{report}"
         }]
         response = self.llm_client.chat(messages)
         
@@ -283,65 +356,49 @@ def with_validation(max_attempts: int = 3):
     Args:
         max_attempts: 최대 재시도 횟수
     """
-    def _record_past_report(llm_client: BaseLLMClient, report: str, attempt: int) -> str:
-        """
-        이전 리포트 내용을 대화 기록에 추가
-        """
-        llm_client.chat_history.append({
-            "role": "user",
-            "content": f"이전 ({attempt + 1}번째) 리포트 내용:\n{report}"
-        })
-
-
     def decorator(func: Callable[..., str]) -> Callable[..., str]:
         @wraps(func)
         def wrapper(self: 'NoteManager', *args: Any, **kwargs: Any) -> str:
             # 초기 리포트 생성
             report = func(self, *args, **kwargs)
-            _record_past_report(self.generator.llm_client, report, 0)
+            assistant_report_list = []
             
             # 검증 및 개선 반복
             for attempt in range(max_attempts):
+                user_request = '\n'.join([f"{msg['content']}" for msg in self.generator.llm_client.chat_history[attempt] if msg['role'] == 'user'])
+                assistant_report = '\n'.join([f"{msg['content']}" for msg in self.generator.llm_client.chat_history[attempt] if msg['role'] == 'assistant'])
+                assistant_report_list.append(assistant_report)
                 is_valid, issues, suggestions = self.critic.validate_report(
                     report, 
-                    self.generator.llm_client.system_prompt
+                    self.generator.llm_client.system_prompt,
+                    user_request
                 )
                 
                 if is_valid:
                     # 검증 성공 시 대화 내용 초기화
-                    self.generator.llm_client.chat_history = []
+                    self.generator.llm_client.clear_chat_history()
+                    self.critic.llm_client.clear_chat_history()
                     return report, is_valid
                 
-                _record_past_report(self.generator.llm_client, report, attempt)
-                
-                print(f"\n시도 {attempt + 1}/{max_attempts}")
-                print("발견된 문제점:")
-                for issue in issues:
-                    print(f"- {issue}")
-                print("\n개선 제안:")
-                for suggestion in suggestions:
-                    print(f"- {suggestion}")
-                
-                print("\n이전 리포트들의 내용:")
-                for record in self.generator.llm_client.chat_history:
-                    print(f"- {record['content']}")
-                print("====================================")
-                
                 if attempt < max_attempts - 1:
-                    print("\n수정된 보고서로 재시도...")
+                    past_reports = ''
+                    for i, assistant_report in enumerate(assistant_report_list):
+                        past_reports += f"이전 시도 {i+1}의 내용:\n{assistant_report}\n"
+
                     # 개선된 리포트 생성 (이전 리포트 내용 포함)
                     report = self.generator.llm_client.chat([{
                         "role": "user",
-                        "content": f"이전 리포트에 다음과 같은 문제가 있었습니다. 해당 내용을 바탕으로 기존 리포트를 수정해주세요. 수정 이후의 리포트만을 반환해주세요. 변경사항은 리포트에 포함하지 않습니다.:\n" + 
+                        "content": f"이전 리포트에 다음과 같은 문제가 있었습니다. 해당 내용을 바탕으로 기존 리포트를 수정해주세요. 수정 이후의 리포트만을 반환해주세요.:\n" + 
                                   "\n".join(f"- {issue}" for issue in issues) + "\n\n" +
                                   "개선 제안:\n" +
                                   "\n".join(f"- {suggestion}" for suggestion in suggestions) + "\n\n" +
-                                  "이전 리포트들의 내용:\n" + "\n".join(f"- {record['content']}" for record in self.generator.llm_client.chat_history)
+                                  "이전 시도들의 내용:\n" + past_reports
                     }])
                 else:
                     print("\n최대 시도 횟수 도달. 마지막 리포트를 반환합니다.")
                     # 최대 시도 횟수 도달 시에도 대화 내용 초기화
-                    self.generator.llm_client.chat_history = []
+                    self.generator.llm_client.clear_chat_history()
+                    self.critic.llm_client.clear_chat_history()
 
             return report, is_valid
         return wrapper
@@ -418,37 +475,30 @@ class NoteManager:
         messages = [{
             "role": "user",
             "content": (
-                "Please provide a comprehensive summary of today's 'daily activity reports'.\n\n"
-                "Follow this structure:\n"
-                "1. For each section (created/modified/deleted notes):\n"
-                "   - Include only if there are notes in that category\n"
-                "   - For each note:\n"
-                "     * Title\n"
-                "     * Key keywords\n"
-                "     * Type of work performed\n"
-                "     * Main content summary\n\n"
-                "2. Overall Summary (only if there are any activities):\n"
-                "   - Main types of work performed\n"
-                "   - Key themes\n"
-                "   - Activity patterns\n\n"
-                "Use bullet points for better readability.\n"
-                "If there are no activities, simply state that.\n\n"
-                "Here are the details:\n\n" +
-                "\n\n".join(sections)
+            f"Generate a DailyReport base on the information below:\n\n"
+            f"Report Type: DailyReport\n"
+            f"Newly Created Notes:\n{'\n'.join(sections[0])}\n"
+            f"Modified Notes:\n{'\n'.join(sections[1])}\n"
+            f"Deleted Notes:\n{'\n'.join(sections[2])}\n"
             )
         }]
 
         report = self.generator.llm_client.chat(messages)
         return report
     
-    def write_daily_report(self, dirpath, created_files, modified_files, deleted_files) -> None:
+    def write_daily_report(self, dirpath: Path, created_files, modified_files, deleted_files) -> None:
         """Write daily report to file"""
-       # 오늘 날짜 구하기
+        # 오늘 날짜 구하기
         date_str = __import__("datetime").date.today().isoformat()
         report, is_valid = self._generate_daily_report(created_files, modified_files, deleted_files)
-        with open(os.path.join(dirpath, f"{date_str}.md"), "w", encoding="utf-8") as f:
+        
+        # 파일 경로 생성
+        report_path = dirpath / f"{date_str}.md"
+        
+        # 파일 저장
+        with open(report_path, "w", encoding="utf-8") as f:
             f.write(report)
-        print(f"Daily report written to {os.path.join(dirpath, f'{date_str}.md')}")
+        print(f"Daily report written to {report_path}")
 
 if __name__ == "__main__":
     import os

@@ -64,18 +64,33 @@ def diff_contents(old: str, new: str) -> List[str]:
     return changes
 
 def detect_changes(
-    prev: Dict[str, str],
-    curr: Dict[str, str]
-) -> Tuple[List[str], List[str], Dict[str, List[str]]]:
-    created = [p for p in curr if p not in prev]
-    deleted = [p for p in prev if p not in curr]
-    modified = {}
-    for p in curr:
-        if p in prev and prev[p] != curr[p]:
-            modified[p] = diff_contents(prev[p], curr[p])
+    prev_filestates: Dict[str, str],
+    curr_filestates: Dict[str, str]
+):
+    created, modified, deleted = {}, {}, {}
+
+    print(f"prev_filestates: {list(prev_filestates.keys())}")
+    print(f"curr_filestates: {list(curr_filestates.keys())}")
+
+    for p in curr_filestates.keys():
+        if p not in prev_filestates.keys():
+            created[p] = {'content': curr_filestates[p],
+                          'changes': []}
+    for p in prev_filestates.keys():
+        if p not in curr_filestates.keys():
+            deleted[p] = {'content': prev_filestates[p],
+                          'changes': []}
+        else:
+            modified[p] = {'content': curr_filestates[p],
+                           'changes': diff_contents(prev_filestates[p], curr_filestates[p])}
+    
+    print(f"created: {created}")
+    print(f"modified: {modified}")
+    print(f"deleted: {deleted}")
+
     return created, deleted, modified
 
-def get_recent_changes(vault_path: Path, hours: int = 24, exclude_dirs: List[str] = None, update_state: bool = True):
+def get_recent_changes(vault_path: Path, exclude_dirs: List[str] = None, update_state: bool = True, cutoff_hours: int = 24):
     """
     Vault의 최근 변경사항을 감지합니다.
     
@@ -92,53 +107,53 @@ def get_recent_changes(vault_path: Path, hours: int = 24, exclude_dirs: List[str
     prev_state = load_previous_state()
     # 2. 현재 Vault 스캔
     curr_state = scan_vault(vault_path)
+
+    if prev_state == {}:
+        prev_state = curr_state
+        save_state(prev_state)
     # 3. 변경 감지
     created, deleted, modified = detect_changes(prev_state, curr_state)
     
     # 시간 필터링을 위한 기준 시간
-    cutoff = datetime.now() - timedelta(hours=hours)
+    cutoff = datetime.now() - timedelta(hours=cutoff_hours)
 
     print(f"Cutoff: {cutoff}")
     
     # 최근 생성/수정된 파일만 필터링
-    recent_created = {} # path: content
-    recent_deleted = {} # path: content
-    recent_modified = {} # path: content
+    recent_created = {} # path: dict[field : value]
+    recent_deleted = {} # path: dict[field : value]
+    recent_modified = {} # path: dict[field : value]
     
     def should_exclude(path: str) -> bool:
         """파일이 제외할 디렉토리 하위에 있는지 확인"""
         path_parts = Path(path).parts
         return any(exclude_dir in path_parts for exclude_dir in exclude_dirs)
     
-    for path in created:
-        if should_exclude(path):
-            continue
-            
-        file_time = datetime.fromtimestamp(Path(path).stat().st_mtime)
-        print(f"{path} File time: {file_time}")
-        if file_time > cutoff:
-            recent_created[path] = curr_state[path]
+    def is_recent(path: str) -> bool:
+        """파일이 최근에 수정되었는지 확인"""
+        try:
+            file_time = datetime.fromtimestamp(Path(path).stat().st_mtime)
+            return file_time > cutoff
+        except Exception:
+            return False
     
-    for path in deleted:
-        if should_exclude(path):
+    # 생성된 파일 필터링
+    for path, content in created.items():
+        if should_exclude(path) or not is_recent(path):
             continue
-        recent_deleted[path] = prev_state[path]
-            
-    for path, diff in modified.items():
-        if should_exclude(path):
-            continue
-            
-        file_time = datetime.fromtimestamp(Path(path).stat().st_mtime)
-        if file_time > cutoff:
-            recent_modified[path] = diff
+        recent_created[path] = content
     
-    # 4. 결과 리턴
-    print(f"Created (last {hours}h):", recent_created)
-    print("Deleted:", recent_deleted)
-    print(f"Modified (last {hours}h):")
-    for path, diff in recent_modified.items():
-        print(f"\n--- {path} ---")
-        print("\n".join(diff))
+    # 삭제된 파일 필터링
+    for path, content in deleted.items():
+        if should_exclude(path):
+            continue
+        recent_deleted[path] = content
+            
+    # 수정된 파일 필터링
+    for path, changes in modified.items():
+        if should_exclude(path) or not is_recent(path):
+            continue
+        recent_modified[path] = changes
         
     # 5. 스냅샷 갱신 (update_state가 True일 때만)
     if (not os.path.isfile(get_state_file())) or update_state:

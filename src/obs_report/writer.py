@@ -2,7 +2,41 @@
 
 from pathlib import Path
 from datetime import datetime, date, timedelta
-from llm_clinet import summarize_daily_notes
+import json
+from fpdf import FPDF
+from typing import List, Dict, Tuple
+from .parser import DocumentData
+
+def summarize_daily_notes(
+    created_docs: List[DocumentData],
+    modified_docs: List[Tuple[DocumentData, str]],
+    deleted_files: List[str]
+) -> str:
+    """일간 노트 요약을 생성합니다."""
+    summary = []
+    
+    if created_docs:
+        summary.append("## 새로 생성된 노트")
+        for doc in created_docs:
+            summary.append(f"### {doc.title}")
+            summary.append(doc.content)
+            summary.append("")
+    
+    if modified_docs:
+        summary.append("## 수정된 노트")
+        for doc, changes in modified_docs:
+            summary.append(f"### {doc.title}")
+            summary.append("변경사항:")
+            summary.append(changes)
+            summary.append("")
+    
+    if deleted_files:
+        summary.append("## 삭제된 노트")
+        for file_path in deleted_files:
+            summary.append(f"- {file_path}")
+        summary.append("")
+    
+    return "\n".join(summary)
 
 def write_daily_note(summary: str, vault_path: Path) -> Path:
     """
@@ -87,8 +121,8 @@ def _write_section(file_path: Path, section_title: str, content: str):
 
 if __name__ == "__main__":
     from pathlib import Path
-    from parser import parse_markdown
-    from watcher import get_recent_changes
+    from .parser import parse_markdown
+    from .watcher import get_recent_changes
     
     # 테스트용 실행
     vault_dir = Path.home() / "Documents" / "Obsidian Vault"
